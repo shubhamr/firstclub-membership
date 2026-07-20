@@ -1,0 +1,15 @@
+package com.firstclub.membership.model;
+
+public enum EventType {
+  SUBSCRIBED,
+  UPGRADED,
+  DOWNGRADED,
+  AUTO_UPGRADED,
+  CANCELLED,
+  REFUNDED,
+  TRIAL_CONVERTED,
+  TRIAL_CONVERSION_FAILED,
+  RENEWED,
+  RENEWAL_FAILED,
+  EXPIRED
+}

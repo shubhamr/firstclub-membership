@@ -1,0 +1,168 @@
+erDiagram
+    membership_plan ||--o{ subscription : "billed by"
+    membership_tier ||--o{ subscription : "grants"
+    membership_tier ||--|| tier_criteria : "qualifies via"
+    membership_tier ||--o{ tier_benefit : "unlocks"
+    benefit         ||--o{ tier_benefit : "mapped by"
+    subscription    ||--o{ subscription_event : "audited by"
+    subscription    ||--o{ credit_note : "refunded by"
+    subscription    ||--o{ payment : "paid by"
+    app_user        ||--o{ subscription : "subscribes"
+    app_user        ||--o{ subscription_event : "acts in"
+    app_user        ||--o{ credit_note : "credited"
+    app_user        ||--o{ payment : "pays"
+    app_user        ||--o| user_order_stats : "has"
+    app_user        ||--o{ user_order_event : "places"
+    app_user        ||--o{ user_monthly_spend : "accrues"
+
+    app_user {
+        bigint      id PK "identity, start 8000"
+        varchar     name
+        varchar     email UK
+        varchar     cohort "nullable"
+        timestamptz created_at
+    }
+
+    membership_plan {
+        bigserial     id PK
+        varchar       cadence UK "MONTHLY / QUARTERLY / ..."
+        varchar       name
+        numeric       price
+        integer       duration_days
+        integer       trial_days "0 = no trial; YEARLY seeded 7"
+        boolean       active
+        timestamptz   created_at
+        timestamptz   updated_at
+    }
+
+    membership_tier {
+        bigserial   id PK
+        varchar     code UK
+        varchar     name
+        integer     rank UK "rank-ordered"
+        numeric     price_multiplier "premium over base: GOLD 1.5x, PLATINUM 2x"
+        boolean     active
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    tier_criteria {
+        bigserial   id PK
+        bigint      tier_id FK,UK
+        integer     min_orders "nullable = rule N/A"
+        numeric     min_monthly_spend "nullable = rule N/A"
+        jsonb       cohorts "default []"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    benefit {
+        bigserial   id PK
+        varchar     code UK
+        varchar     type "FREE_DELIVERY / EXTRA_DISCOUNT / EXCLUSIVE_DEALS / EXCLUSIVE_COUPONS / PRIORITY_SUPPORT"
+        varchar     name
+        varchar     description "nullable"
+        boolean     active
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    tier_benefit {
+        bigserial   id PK
+        bigint      tier_id FK
+        bigint      benefit_id FK
+        jsonb       params "per-tier tuning, e.g. {discountPct:10} / {couponsPerCycle:2}"
+        boolean     active
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    subscription {
+        bigserial   id PK
+        bigint      user_id FK "indexed"
+        bigint      plan_id FK
+        bigint      tier_id FK
+        varchar     status "PENDING / ACTIVE / EXPIRED / CANCELLED"
+        timestamptz start_at
+        timestamptz expires_at "partial idx where ACTIVE"
+        boolean     auto_renew
+        numeric     price_paid "locked at purchase (grandfathering)"
+        timestamptz trial_end "nullable; cleared on convert to paid"
+        integer     renewal_attempts "consecutive failed renewals (dunning)"
+        timestamptz next_retry_at "nullable; next dunning retry"
+        bigint      version "optimistic lock"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    credit_note {
+        bigserial   id PK
+        bigint      subscription_id FK
+        bigint      user_id FK "indexed with created_at"
+        numeric     amount
+        varchar     reason
+        timestamptz created_at
+    }
+
+    payment {
+        bigserial   id PK
+        bigint      subscription_id FK
+        bigint      user_id FK
+        varchar     reference UK "doubles as gateway idempotency key"
+        numeric     amount
+        varchar     currency "3-char code, default INR"
+        varchar     status "INTENDED / CHARGED / APPLIED / ABANDONED / REFUNDED"
+        varchar     gateway_txn_id "nullable until charged"
+        varchar     purpose "SUBSCRIBE / UPGRADE / RENEWAL / TRIAL_CONVERSION"
+        varchar     failure_reason "nullable"
+        bigint      version "optimistic lock"
+        timestamptz created_at "partial idx where CHARGED = money moved, not applied"
+        timestamptz updated_at
+    }
+
+    subscription_event {
+        bigserial   id PK
+        bigint      subscription_id FK
+        bigint      user_id FK "indexed with created_at"
+        varchar     type
+        jsonb       detail "default {}"
+        timestamptz created_at
+    }
+
+    user_order_stats {
+        bigint        user_id PK,FK
+        integer       order_count "lifetime"
+        jsonb         cohorts "default []"
+        timestamptz   updated_at
+    }
+
+    user_order_event {
+        bigint        order_id PK "idempotency key; re-delivery is a no-op"
+        bigint        user_id FK
+        numeric       amount "one order's value; refund re-asserts lower"
+        timestamptz   occurred_at "decides the spend month, not receipt time"
+        timestamptz   received_at
+    }
+
+    user_monthly_spend {
+        bigint        user_id PK,FK
+        varchar       year_month PK "'YYYY-MM', UTC"
+        numeric       amount "derived: SUM over user_order_event for the month"
+        timestamptz   updated_at
+    }
+
+    idempotency_key {
+        bigserial   id PK
+        varchar     idem_key "UK with endpoint"
+        varchar     endpoint
+        integer     status_code
+        text        response_body
+        timestamptz created_at
+    }
+
+    job_cursor {
+        varchar     job_name PK "one row per sweep job"
+        bigint      last_id "highest id processed; 0 = from the start"
+        bigint      version "optimistic lock"
+        timestamptz updated_at
+    }

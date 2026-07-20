@@ -1,0 +1,152 @@
+spring:
+  application:
+    name: firstclub-membership
+
+  # Load local dev overrides from .env (gitignored) so `mvn spring-boot:run` works without
+  # exporting env vars by hand — e.g. when the compose host ports aren't the 5432/6379 defaults.
+  # `optional:` means no .env is a non-error, so CI and prod are unaffected. Real environment
+  # variables still win: OS env outranks a config import, as do Testcontainers' dynamic properties.
+  config:
+    import: optional:file:.env[.properties]
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/membership}
+    username: ${DB_USER:membership}
+    password: ${DB_PASSWORD:membership}
+    hikari:
+      pool-name: membership-pool
+      maximum-pool-size: ${DB_POOL_MAX:16}
+      minimum-idle: 4
+      connection-timeout: 3000   # fail fast rather than pile up threads waiting on a saturated pool
+
+  jpa:
+    open-in-view: false          # OSIV off: no lazy loading leaking into the web layer / holding connections
+    hibernate:
+      ddl-auto: validate         # schema is owned by Flyway, never by Hibernate
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 25
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+
+  # Read-heavy catalog cache, in-memory (ConcurrentMap) so it needs no extra service to run.
+  # The seam is Spring's CacheManager, which every @Cacheable call site depends on, so a production
+  # deployment can back it with a shared/distributed cache without service-code changes (see
+  # ARCHITECTURE.md). Staleness is bounded by @CacheEvict on every catalog mutation
+  # (see BenefitAdminServiceImpl), not a TTL.
+  cache:
+    type: simple
+    cache-names: plans,tiers,tierBenefits
+
+  # Spring's default scheduler pool size is ONE. Six @Scheduled jobs share it, and their crons are
+  # aligned (0 */5, 0 */10, 0 */15 all fire together on the hour), so a long reconciliation run
+  # queues every other job behind it — including RenewalJob, which means members lapse without a
+  # renewal ever being attempted. The jobs are independent; give them threads to match.
+  task:
+    scheduling:
+      pool:
+        size: ${SCHEDULER_POOL_SIZE:4}
+
+server:
+  port: ${SERVER_PORT:8080}
+
+security:
+  jwt:
+    # HS256 signing secret (>= 32 bytes). NO DEFAULT, deliberately: a committed signing key lets
+    # anyone with the repo forge a token for any user with role=ADMIN, offline, with no endpoint
+    # involved. That makes every authorization control decorative, so startup fails without it.
+    # `.env` (see .env.example) supplies it for local runs.
+    secret: ${JWT_SECRET}
+    ttl-hours: 12
+
+# Resilience4j circuit breaker around the payment port. This is the ONLY resilience primitive wired
+# onto the charge today: a slow call (> slow-call-duration-threshold) counts toward the slow-call rate
+# and trips the breaker. A per-call TimeLimiter/bulkhead would need the adapter to go async (return a
+# CompletableFuture) and set real HTTP connect/read timeouts — that's a deliberate [Blueprint], not
+# wired here, so it isn't configured as dead settings that imply otherwise. See ARCHITECTURE.md §2.1.
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentGateway:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 60
+
+membership:
+  # Authorization is always enforced (JwtAuthFilter + @PreAuthorize). Token *issuance* below is a dev
+  # stand-in for a real IdP — hardened so it can't be an open admin oracle.
+  auth:
+    # The dev /auth/token endpoint mints a token for ANY userId in the request body, with no
+    # credential. That means it chooses `authentication.name` — which is what every @PreAuthorize in
+    # this codebase compares against. Left on by default it silently satisfies the entire
+    # authorization layer, so it is OFF by default and SecurityDefaultsGuard refuses to start with it
+    # enabled outside dev/test. Set AUTH_DEV_TOKEN_ENABLED=true (as .env does) to demo the console.
+    dev-token:
+      enabled: ${AUTH_DEV_TOKEN_ENABLED:false}
+      # Acknowledges the above when no dev/test profile is active. Needed because
+      # spring.profiles.active cannot be set from .env — profiles are resolved before that file is
+      # imported — so a profile alone could not gate the documented local workflow.
+      allow-outside-dev: ${AUTH_DEV_TOKEN_ALLOW_OUTSIDE_DEV:false}
+    # Minting an ADMIN token requires this secret (constant-time compared). NO DEFAULT: a default is a
+    # known constant in git, and a constant-time compare against a public value is theatre. Blank =
+    # admin minting is impossible, which is the correct behaviour when unconfigured.
+    admin-bootstrap-secret: ${ADMIN_BOOTSTRAP_SECRET:}
+  # Expiry sweep cadence. Lazy expiry on read is the source of truth; this only normalizes status.
+  # The same sweep reaps PENDING reservations older than reservation-ttl-minutes (orphaned by a crash
+  # between reserve and charge in the reserve→charge→activate flow).
+  expiry-sweep-cron: "0 */5 * * * *"
+  # A subscribe reservation should resolve (charge + activate) in well under a second; anything still
+  # PENDING past this window is orphaned and gets cancelled so it stops blocking the user.
+  reservation-ttl-minutes: ${RESERVATION_TTL_MINUTES:15}
+  # Grace window (days) after expiry during which benefits continue while renewal/dunning is attempted.
+  grace-period-days: 3
+  # Tier reconciliation backfill (recompute tiers for active users, catching missed activity events).
+  reconciliation-cron: "0 */15 * * * *"
+  # Convert elapsed free trials to paid (charge + extend).
+  trial-conversion-cron: "0 */10 * * * *"
+  # Renewal (charge at expiry) + dunning (retry a failed renewal on a schedule before revoking).
+  renewal-cron: "0 */10 * * * *"
+  renewal:
+    max-dunning-attempts: 4
+    retry-schedule-days: 1,3,5,7
+  # Idempotency-key retention + reaping cadence (keeps the idempotency_key table bounded).
+  idempotency-retention-hours: 24
+  idempotency-cleanup-cron: "0 30 * * * *"
+  # Payment ledger reconciliation: find charges that took money and never applied (a crash between
+  # the gateway call and the applying transaction). Alerts rather than auto-remediating, because
+  # "complete it" and "refund it" are both consequential and depend on why the apply failed.
+  payment-reconciliation-cron: "0 */5 * * * *"
+  payment:
+    # How long a CHARGED ledger row may legitimately sit before it counts as stuck. The apply
+    # transaction runs milliseconds after the charge, so anything past this is a real discrepancy.
+    settle-window-minutes: ${PAYMENT_SETTLE_WINDOW_MINUTES:15}
+  # Pricing strategy selection. BASE is the only mode shipped; the seam exists so a new one is a
+  # bean plus an enum constant rather than a change to the subscribe flow.
+  pricing:
+    mode: ${PRICING_MODE:BASE}
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    com.firstclub.membership: INFO

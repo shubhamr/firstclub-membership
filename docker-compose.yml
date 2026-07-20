@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: membership-postgres
+    environment:
+      POSTGRES_DB: membership
+      POSTGRES_USER: membership
+      POSTGRES_PASSWORD: membership
+    ports:
+      # Override the host port if 5432 is taken locally, e.g. PG_HOST_PORT=5433 docker compose up -d
+      - "${PG_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U membership -d membership"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Fully-containerised app: `docker compose --profile app up -d --build` runs the whole
+  # stack with no local Maven/JDK. The default (no profile) still starts only Postgres
+  # so the app can be run from an IDE / `mvn spring-boot:run` during development.
+  app:
+    build: .
+    container_name: membership-app
+    profiles: ["app"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Talk to the sibling containers over the compose network (internal ports, not host mappings).
+      DB_URL: jdbc:postgresql://postgres:5432/membership
+      DB_USER: membership
+      DB_PASSWORD: membership
+      # The image ships only the jar, so the app container never reads .env — every value the app
+      # needs must be passed explicitly here. `:?` aborts the run with this message rather than
+      # letting Spring fail on an unresolvable placeholder seconds later.
+      JWT_SECRET: ${JWT_SECRET:?run `cp .env.example .env` first — JWT_SECRET has no default}
+      # Without these the dev-token route is conditioned away and the demo cannot mint the bearer
+      # tokens every authenticated call needs.
+      AUTH_DEV_TOKEN_ENABLED: ${AUTH_DEV_TOKEN_ENABLED:-true}
+      AUTH_DEV_TOKEN_ALLOW_OUTSIDE_DEV: ${AUTH_DEV_TOKEN_ALLOW_OUTSIDE_DEV:-true}
+      ADMIN_BOOTSTRAP_SECRET: ${ADMIN_BOOTSTRAP_SECRET:-}
+    ports:
+      - "${APP_HOST_PORT:-8080}:8080"
+
+volumes:
+  pgdata:

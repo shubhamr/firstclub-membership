@@ -1,0 +1,41 @@
+# Test profile: Postgres comes from Testcontainers (@ServiceConnection). Caching is the same
+# in-memory manager as production, so tests exercise DB-level guarantees in isolation.
+spring:
+  # SecurityDefaultsGuard refuses to start with the dev token endpoint enabled outside dev/test.
+  # Tests legitimately need it (they mint tokens for arbitrary users), so they declare the profile
+  # that makes that legitimate rather than the guard carving out a test-shaped exception.
+  profiles:
+    active: test
+  cache:
+    type: simple
+    cache-names: plans,tiers,tierBenefits
+  jpa:
+    open-in-view: false
+    hibernate:
+      # This file shadows the main application.yml by classpath name, so ddl-auto is NOT inherited:
+      # without this line Boot defaults it to `none` against a Testcontainers datasource, and
+      # entity/schema drift would only surface at `spring-boot:run`.
+      ddl-auto: validate
+
+membership:
+  auth:
+    dev-token:
+      enabled: true
+    admin-bootstrap-secret: test-admin-bootstrap-secret
+  # disable scheduled jobs during tests; invoked explicitly where needed
+  expiry-sweep-cron: "-"
+  reconciliation-cron: "-"
+  idempotency-cleanup-cron: "-"
+  trial-conversion-cron: "-"
+  renewal-cron: "-"
+  payment-reconciliation-cron: "-"
+
+security:
+  jwt:
+    secret: test-secret-test-secret-test-secret-0123456789
+    ttl-hours: 12
+
+logging:
+  level:
+    com.firstclub.membership: INFO
+    org.testcontainers: WARN
